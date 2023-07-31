@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -26,6 +27,17 @@ from torch.utils._python_dispatch import (
     _pop_mode_temporarily,
 )
 from torch.utils._pytree import tree_flatten
+
+
+@contextmanager
+def _turn_off_is_fx_tracing():
+    _old_is_tracing = torch.fx._symbolic_trace._is_fx_tracing_flag
+
+    try:
+        torch.fx._symbolic_trace._is_fx_tracing_flag = False
+        yield
+    finally:
+        torch.fx._symbolic_trace._is_fx_tracing_flag = _old_is_tracing
 
 
 @dataclass
@@ -74,7 +86,10 @@ def exported_cond(op, *args):
 
                 # need to do it together otherwise will need to merge input ->
                 # duplicated effort with what we have already
-                gm, guards, example_inputs = torch._dynamo.export(wrapper, new_args, rewrite_sig=False, fake_mode=fake_tensor_mode)
+                with _turn_off_is_fx_tracing():
+                    expo_result = torch._dynamo.export(wrapper, rewrite_sig=False, fake_mode=fake_tensor_mode)(new_args)
+                gm, guards = expo_result
+                example_inputs = expo_result.example_inputs
                 example_inputs_ids = [id(inp) for inp in example_inputs]
                 id_to_name = {id(guard.obj_weakref()): guard.name for guard in guards if guard.obj_weakref is not None and id(guard.obj_weakref()) in example_inputs_ids}
                 example_names = [id_to_name[id(inp)] for inp in example_inputs]

@@ -302,13 +302,9 @@ class _TorchDynamoContext:
         @functools.wraps(fn)
         def _fn(*args, **kwargs):
 
-            def under_tracing_mode():
-                py_dispatch_modes = _get_current_dispatch_mode_stack()
-                return any((mode.is_tracing for mode in py_dispatch_modes if isinstance(mode, ProxyTorchDispatchMode)))
-
             if (
                not isinstance(self, DisableContext)
-               and under_tracing_mode()
+               and torch.fx._symbolic_trace.is_fx_tracing()
             ):
                if config.error_on_nested_fx_trace:
                    raise RuntimeError(
@@ -852,8 +848,13 @@ class FlattenInputOutputSignature(torch.fx.interpreter.Transformer):
 class ExportResult(NamedTuple):
     graph_module: torch.fx.GraphModule
     guards: Set[_guards.Guard]
-    # NB: Do not add new fields without overriding __iter__; people are
+    example_inputs: List[Any]
+
+    # NB: Do not add new fields in __iter__; people are
     # destructuring so it is BC-breaking
+    def __iter__(self):
+        yield self.graph_module
+        yield self.guards
 
 
 def export(
@@ -868,6 +869,7 @@ def export(
     constraints: Optional[List[Constraint]] = None,
     assume_static_by_default: bool = False,
     fake_mode: fake_tensor.FakeTensorMode = None,
+    rewrite_sig: bool = True,
     **extra_kwargs,
 ) -> Callable[..., ExportResult]:
     """
@@ -1076,19 +1078,26 @@ def export(
         assert out_guards is not None, "Failed to produce guards during tracing"
         assert fake_mode is not None
 
-        matched_input_elements_positions = produce_matching(
-            flat_args, graph_captured_input
-        )
+        if rewrite_sig:
+            matched_input_elements_positions = produce_matching(
+                flat_args, graph_captured_input
+            )
 
         # NB: This is mostly hitting the cache; Dynamo already converted these
-        example_fake_inputs = [fake_mode.from_tensor(t) for t in example_inputs]
+        from torch._subclasses.fake_tensor import FakeTensor
+        def create_fake(t):
+            if isinstance(t, torch.Tensor) and not isinstance(t, FakeTensor):
+                return fake_mode.from_tensor(t)
+            return t
+        example_fake_inputs = [create_fake(t) for t in example_inputs]
         flat_results_traced, out_spec_traced = pytree.tree_flatten(result_traced)
 
         assert graph_captured_result is not None
         flat_both = list(graph_captured_result) + flat_args
-        matched_output_elements_positions = produce_matching(
-            flat_both, flat_results_traced
-        )
+        if rewrite_sig:
+            matched_output_elements_positions = produce_matching(
+                flat_both, flat_results_traced
+            )
 
         if aten_graph:
             # Running graph with interpreter is needed for propagating the stack_trace
@@ -1110,14 +1119,17 @@ def export(
                     # Wrap the internal error to the user-facing error
                     raise UserError(UserErrorType.DYNAMIC_CONTROL_FLOW, str(e))
 
-        new_graph = FlattenInputOutputSignature(
-            graph,
-            flat_args,
-            matched_input_elements_positions,
-            matched_output_elements_positions,
-            example_fake_inputs,
-            fake_mode,
-        ).transform()
+        if rewrite_sig:
+            new_graph = FlattenInputOutputSignature(
+                graph,
+                flat_args,
+                matched_input_elements_positions,
+                matched_output_elements_positions,
+                example_fake_inputs,
+                fake_mode,
+            ).transform()
+        else:
+            new_graph = graph
 
         # Store constraints and inputs as metadata for user passes, e.g. turn constraints to runtime check
         new_graph.meta["input_shape_constraints"] = (
@@ -1211,16 +1223,17 @@ def export(
 
             return input_strs
 
-        new_graph.graph._codegen = _PyTreeCodeGen(
-            _PyTreeInfo(
-                argument_names(f, *args, **kwargs),
-                in_spec,
-                out_spec_traced,
+        if rewrite_sig:
+            new_graph.graph._codegen = _PyTreeCodeGen(
+                _PyTreeInfo(
+                    argument_names(f, *args, **kwargs),
+                    in_spec,
+                    out_spec_traced,
+                )
             )
-        )
 
         new_graph.recompile()
-        return ExportResult(new_graph, out_guards)
+        return ExportResult(new_graph, out_guards, example_inputs=example_inputs)
 
     if extra_args or extra_kwargs:
         warnings.warn(
