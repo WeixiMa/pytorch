@@ -60,8 +60,7 @@ class TestPassInfra(TestCase):
         x = torch.tensor([2])
         y = torch.tensor([5])
         mod = M()
-        ep = export(mod, (torch.tensor(True), x, y)).transform(ExportPassBase())
-
+        _ = export(mod, (torch.tensor(True), x, y)).transform(ExportPassBase())
 
 
 if __name__ == '__main__':
