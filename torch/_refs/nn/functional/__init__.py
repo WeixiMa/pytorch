@@ -25,7 +25,6 @@ __all__ = [
     "alpha_dropout",
     "celu",
     "celu_",
-    "dropout",
     "elu",
     "elu_",
     "gelu",
@@ -176,7 +175,6 @@ def celu(
     return torch.where(a > 0, a, rhs)
 
 
-@register_decomposition(aten.dropout)
 @_inplace_wrapper
 @out_wrapper()
 def dropout(
